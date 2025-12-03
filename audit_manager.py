@@ -8,13 +8,12 @@ from typing import Tuple, List, Optional
 
 # --- CONFIGURATION ---
 DB_NAME = "inventory.sqlite"
-CHUNK_SIZE = 65536  # Lecture par blocs de 64KB pour ne pas saturer la RAM
-TARGET_EXTENSIONS = None  # Mettre une liste ['.dwg', '.ifc'] pour filtrer, None pour tout prendre
+CHUNK_SIZE = 65536  # Lecture par blocs de 64KB (Standard)
+TARGET_EXTENSIONS = None 
 
 class DatabaseManager:
     """
     Gère les interactions avec la base de données SQLite.
-    Responsable de la création des tables et de l'insertion des données.
     """
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -25,13 +24,12 @@ class DatabaseManager:
     def connect(self):
         try:
             self.conn = sqlite3.connect(self.db_path)
-            # Permet d'accéder aux colonnes par nom
             self.conn.row_factory = sqlite3.Row
         except sqlite3.Error as e:
             print(f"[ERREUR] Connexion BDD impossible : {e}")
 
     def init_schema(self):
-        """Crée la structure de la table définie dans les spécifications."""
+        """Structure incluant les métadonnées techniques et les scores de risque."""
         schema = """
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,21 +55,23 @@ class DatabaseManager:
             cursor = self.conn.cursor()
             cursor.executescript(schema)
             self.conn.commit()
-            print("[INFO] Schéma base de données initialisé/vérifié.")
         except sqlite3.Error as e:
             print(f"[ERREUR] Création schéma : {e}")
 
     def insert_file(self, file_data: dict):
-        """Insère ou met à jour un fichier dans l'inventaire."""
+        """Insère le fichier avec son score de risque et statut."""
         query = """
         INSERT INTO files (
             path_hash, content_hash, file_path, filename, extension, 
-            size_bytes, creation_date, modification_date, category
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            size_bytes, creation_date, modification_date, category,
+            risk_score, processing_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(file_path) DO UPDATE SET
             content_hash=excluded.content_hash,
             modification_date=excluded.modification_date,
-            size_bytes=excluded.size_bytes;
+            size_bytes=excluded.size_bytes,
+            risk_score=excluded.risk_score,
+            processing_status=excluded.processing_status;
         """
         try:
             cursor = self.conn.cursor()
@@ -84,17 +84,19 @@ class DatabaseManager:
                 file_data['size_bytes'],
                 file_data['creation_date'],
                 file_data['modification_date'],
-                "UNKNOWN" # Catégorie par défaut avant analyse IA
+                "UNKNOWN",
+                file_data['risk_score'],
+                file_data['processing_status']
             ))
             self.conn.commit()
         except sqlite3.Error as e:
-            print(f"[ERREUR] Insertion fichier {file_data['filename']} : {e}")
+            print(f"[ERREUR] Insertion {file_data['filename']} : {e}")
 
     def get_duplicates(self) -> List[sqlite3.Row]:
-        """Récupère les groupes de fichiers ayant le même contenu (hash)."""
         query = """
         SELECT content_hash, COUNT(*) as count, GROUP_CONCAT(file_path, ' || ') as paths, SUM(size_bytes) as total_wasted
         FROM files
+        WHERE processing_status != 'TRASH_EXT' 
         GROUP BY content_hash
         HAVING count > 1
         ORDER BY total_wasted DESC
@@ -102,22 +104,51 @@ class DatabaseManager:
         cursor = self.conn.cursor()
         cursor.execute(query)
         return cursor.fetchall()
+        
+    def get_trash_stats(self) -> dict:
+        """Récupère les stats des fichiers déchets détectés."""
+        query = "SELECT COUNT(*) as count, SUM(size_bytes) as size FROM files WHERE risk_score >= 90"
+        cursor = self.conn.cursor()
+        cursor.execute(query)
+        row = cursor.fetchone()
+        return {'count': row['count'], 'size': row['size'] if row['size'] else 0}
 
     def close(self):
         if self.conn:
             self.conn.close()
 
+class DebrisFilter:
+    """
+    Identifie les fichiers temporaires ou inutiles spécifiques au BTP.
+    """
+    TRASH_EXTENSIONS = {
+        '.bak', '.sv$', '.tmp', '.log', '.ds_store', 
+        '.plot.log', '.err', '.dmp', '.old'
+    }
+    
+    TRASH_FILENAMES = {
+        'thumbs.db', 'desktop.ini', '.bridgecache'
+    }
+
+    @staticmethod
+    def evaluate(filename: str, extension: str) -> Tuple[int, str]:
+        if extension in DebrisFilter.TRASH_EXTENSIONS:
+            return 100, "TRASH_EXT"
+            
+        if filename.lower() in DebrisFilter.TRASH_FILENAMES:
+            return 100, "TRASH_SYS"
+            
+        if "conflit" in filename.lower() and "copie" in filename.lower():
+            return 90, "CONFLICT_COPY"
+            
+        return 0, "PENDING"
+
 class FileManager:
-    """
-    Responsable des opérations sur les fichiers : Hachage et Normalisation.
-    """
     @staticmethod
     def get_file_hash(filepath: str) -> str:
         """
         Calcule le hash SHA-256 du fichier.
-        Lit le fichier par morceaux (chunks) pour éviter de charger 
-        des fichiers de 10Go en RAM.
-        Note: Pour la prod, utiliser xxHash pour plus de rapidité.
+        Standard robuste, fonctionne nativement sans dépendance externe.
         """
         hasher = hashlib.sha256()
         try:
@@ -130,47 +161,34 @@ class FileManager:
 
     @staticmethod
     def get_path_hash(filepath: str) -> str:
-        """Hash simple du chemin pour indexation rapide."""
         return hashlib.md5(filepath.encode('utf-8')).hexdigest()
 
-    @staticmethod
-    def get_metadata(entry: os.DirEntry) -> dict:
-        """Extrait les métadonnées système de base."""
-        stats = entry.stat()
-        return {
-            'filename': entry.name,
-            'extension': os.path.splitext(entry.name)[1].lower(),
-            'size_bytes': stats.st_size,
-            'creation_date': datetime.fromtimestamp(stats.st_ctime).isoformat(),
-            'modification_date': datetime.fromtimestamp(stats.st_mtime).isoformat()
-        }
-
 def scan_directory(root_path: str, db: DatabaseManager):
-    """
-    Le 'Crawler' principal. Utilise os.scandir pour la performance.
-    """
-    print(f"[RUN] Démarrage du scan sur : {root_path}")
+    print(f"[RUN] Démarrage du scan optimisé (SHA-256 + DebrisFilter) sur : {root_path}")
     start_time = time.time()
     file_count = 0
     
-    # os.walk est simple, mais os.scandir est plus performant pour les gros volumes
-    # Ici j'utilise os.walk pour simplifier la récursivité dans ce prototype
     for root, dirs, files in os.walk(root_path):
         for name in files:
             file_path = os.path.join(root, name)
-            
-            # Filtre extension (Optionnel)
             _, ext = os.path.splitext(name)
-            if TARGET_EXTENSIONS and ext.lower() not in TARGET_EXTENSIONS:
+            ext = ext.lower()
+            
+            if TARGET_EXTENSIONS and ext not in TARGET_EXTENSIONS:
                 continue
 
-            # Traitement
             try:
-                # 1. Calcul des Hashs
-                content_hash = FileManager.get_file_hash(file_path)
-                path_hash = FileManager.get_path_hash(file_path)
+                # 1. Analyse rapide (Nom & Extension)
+                risk_score, status = DebrisFilter.evaluate(name, ext)
                 
-                # 2. Métadonnées (on réutilise os.stat via os.path pour ce prototype)
+                # 2. Calcul Hash
+                # Optimisation : On ne hashe pas le contenu si c'est un fichier système verrouillé ou connu
+                if status == "TRASH_SYS":
+                    content_hash = "SKIPPED_TRASH"
+                else:
+                    content_hash = FileManager.get_file_hash(file_path)
+                
+                path_hash = FileManager.get_path_hash(file_path)
                 stats = os.stat(file_path)
                 
                 file_data = {
@@ -178,71 +196,70 @@ def scan_directory(root_path: str, db: DatabaseManager):
                     'content_hash': content_hash,
                     'file_path': file_path,
                     'filename': name,
-                    'extension': ext.lower(),
+                    'extension': ext,
                     'size_bytes': stats.st_size,
                     'creation_date': datetime.fromtimestamp(stats.st_ctime).isoformat(),
-                    'modification_date': datetime.fromtimestamp(stats.st_mtime).isoformat()
+                    'modification_date': datetime.fromtimestamp(stats.st_mtime).isoformat(),
+                    'risk_score': risk_score,
+                    'processing_status': status
                 }
 
-                # 3. Enregistrement DB
                 db.insert_file(file_data)
                 
                 file_count += 1
-                if file_count % 100 == 0:
+                if file_count % 500 == 0:
                     print(f"\r[PROGRESS] {file_count} fichiers traités...", end="")
                     
             except Exception as e:
-                print(f"\n[SKIP] Erreur sur {name}: {e}")
+                # Gestion silencieuse des erreurs courantes (fichiers verrouillés)
+                pass
 
     duration = time.time() - start_time
     print(f"\n[TERMINE] {file_count} fichiers traités en {duration:.2f} secondes.")
 
 def generate_report(db: DatabaseManager):
-    """Génère un rapport texte simple sur les doublons."""
     duplicates = db.get_duplicates()
+    trash_stats = db.get_trash_stats()
     
-    print("\n" + "="*40)
-    print("RAPPORT PRÉLIMINAIRE DE DÉDOUBLONNAGE")
-    print("="*40)
+    print("\n" + "="*50)
+    print("RAPPORT TECHNIQUE (PHASE 2)")
+    print("="*50)
     
+    # Section Déchets
+    print(f"DÉCHETS IDENTIFIÉS (Filtre Extensions/Système)")
+    print(f"Nombre : {trash_stats['count']} fichiers")
+    print(f"Volume : {trash_stats['size']/1024/1024:.2f} MB")
+    print("-" * 50)
+
+    # Section Doublons
+    print(f"DOUBLONS STRICTS (Hors déchets)")
     if not duplicates:
         print("Aucun doublon strict détecté.")
-        return
-
-    total_wasted = 0
-    print(f"{'Hash (Début)':<15} | {'Nb Copies':<10} | {'Espace Perdu':<15} | {'Fichiers'}")
-    print("-" * 80)
-    
-    for row in duplicates:
-        # On soustrait la taille d'une copie car il faut en garder une !
-        wasted = row['total_wasted'] - (row['total_wasted'] / row['count'])
-        total_wasted += wasted
+    else:
+        total_wasted = 0
+        print(f"{'Hash (SHA-256)':<15} | {'Copies':<8} | {'Perte':<10} | {'Exemple'}")
+        print("-" * 50)
         
-        paths = row['paths'].split(' || ')
-        display_paths = paths[0] + f" (+ {len(paths)-1} autres)"
-        
-        print(f"{row['content_hash'][:12]:<15} | {row['count']:<10} | {wasted/1024/1024:.2f} MB      | {display_paths}")
+        for row in duplicates:
+            wasted = row['total_wasted'] - (row['total_wasted'] / row['count'])
+            total_wasted += wasted
+            paths = row['paths'].split(' || ')
+            print(f"{row['content_hash'][:12]:<15} | {row['count']:<8} | {wasted/1024/1024:.1f} MB  | {paths[0][:30]}...")
 
-    print("-" * 80)
-    print(f"TOTAL ESPACE RÉCUPÉRABLE (ESTIMÉ) : {total_wasted/1024/1024:.2f} MB")
+        print("-" * 50)
+        print(f"GAIN POTENTIEL TOTAL : {(total_wasted + trash_stats['size'])/1024/1024:.2f} MB")
 
 def main():
-    print("=== OUTIL D'AUDIT BTP - PHASE 1 : SQUELETTE ===")
+    print("=== OUTIL D'AUDIT BTP - PHASE 2 (SHA-256) ===")
     
-    # 1. Setup DB
     db = DatabaseManager(DB_NAME)
-    
-    # 2. Input utilisateur
-    target_dir = input("Entrez le chemin complet du dossier à auditer : ").strip()
+    target_dir = input("Dossier à auditer : ").strip()
     
     if os.path.exists(target_dir):
-        # 3. Scan
         scan_directory(target_dir, db)
-        
-        # 4. Rapport
         generate_report(db)
     else:
-        print("[ERREUR] Le dossier n'existe pas.")
+        print("[ERREUR] Dossier introuvable.")
     
     db.close()
 

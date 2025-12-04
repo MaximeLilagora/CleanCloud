@@ -4,11 +4,12 @@ from datetime import datetime
 from src.utils.db_client import DatabaseManager
 from src.cleaning.debris_filter import DebrisFilter
 from src.utils.hasher import FileManager
-# Import direct simple
+# Nouvel import du moteur
+from src.utils.metadata_engine import MetadataDispatcher
 from config.settings import TARGET_EXTENSIONS
 
 def scan_directory(root_path: str, db: DatabaseManager):
-    print(f"[RUN] Démarrage du scan sur : {root_path}")
+    print(f"[RUN] Audit Relationnel V2 (Mère/Filles) sur : {root_path}")
     start_time = time.time()
     file_count = 0
     
@@ -22,11 +23,14 @@ def scan_directory(root_path: str, db: DatabaseManager):
                 continue
 
             try:
-                # 1. Analyse rapide
-                risk_score, status = DebrisFilter.evaluate(name, ext)
+                # 1. Analyse Déchets
+                risk_score, category = DebrisFilter.evaluate(name, ext)
+                if category == "PENDING":
+                    # Si ce n'est pas un déchet évident, on classifie 'WORK' par défaut
+                    category = "WORK_FILE"
                 
-                # 2. Calcul Hash
-                if status == "TRASH_SYS":
+                # 2. Hachage Optimisé
+                if category == "TRASH_SYS":
                     content_hash = "SKIPPED_TRASH"
                 else:
                     content_hash = FileManager.get_file_hash(file_path)
@@ -34,27 +38,36 @@ def scan_directory(root_path: str, db: DatabaseManager):
                 path_hash = FileManager.get_path_hash(file_path)
                 stats = os.stat(file_path)
                 
-                file_data = {
+                # 3. MÉTADONNÉES AVANCÉES (Dispatcher)
+                # C'est ici que la magie opère : on demande au moteur "Quelle table ? Quelles infos ?"
+                target_table, meta_payload = MetadataDispatcher.dispatch(file_path, ext)
+
+                # Préparation Données Table Mère
+                main_data = {
                     'path_hash': path_hash,
                     'content_hash': content_hash,
                     'file_path': file_path,
                     'filename': name,
-                    'extension': ext,
+                    'visible_ext': ext,
+                    'true_ext': ext, # A améliorer avec python-magic plus tard
                     'size_bytes': stats.st_size,
-                    'creation_date': datetime.fromtimestamp(stats.st_ctime).isoformat(),
-                    'modification_date': datetime.fromtimestamp(stats.st_mtime).isoformat(),
+                    'dates_created': datetime.fromtimestamp(stats.st_ctime).isoformat(),
+                    'dates_modified': datetime.fromtimestamp(stats.st_mtime).isoformat(),
+                    'category': category,
                     'risk_score': risk_score,
-                    'processing_status': status
+                    'status': 'SCANNED'
                 }
 
-                db.insert_file(file_data)
+                # 4. Insertion Relationnelle
+                db.insert_full_entry(main_data, target_table, meta_payload)
                 
                 file_count += 1
                 if file_count % 500 == 0:
                     print(f"\r[PROGRESS] {file_count} fichiers traités...", end="")
                     
-            except Exception:
+            except Exception as e:
+                # print(f"Err: {e}") # Debug only
                 pass
 
     duration = time.time() - start_time
-    print(f"\n[TERMINE] {file_count} fichiers traités en {duration:.2f} secondes.")
+    print(f"\n[TERMINE] {file_count} fichiers inventoriés en {duration:.2f} secondes.")

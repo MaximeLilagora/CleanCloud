@@ -1,11 +1,11 @@
 import sqlite3
 import json
-from typing import List
+from typing import Optional, Dict
 
 class DatabaseManager:
     """
-    Gère les interactions avec la base de données SQLite.
-    Responsable du schéma et des transactions.
+    Gère l'architecture 'Class Table Inheritance'.
+    1 Table Mère (files_inventory) + 5 Tables Filles (meta_*)
     """
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -17,79 +17,169 @@ class DatabaseManager:
         try:
             self.conn = sqlite3.connect(self.db_path)
             self.conn.row_factory = sqlite3.Row
+            # Activation des Foreign Keys (vital pour SQLite)
+            self.conn.execute("PRAGMA foreign_keys = ON;")
         except sqlite3.Error as e:
-            print(f"[ERREUR] Connexion BDD impossible : {e}")
+            print(f"[ERREUR CRITIQUE] Connexion BDD : {e}")
 
     def init_schema(self):
-        """Structure incluant les métadonnées techniques et les scores de risque."""
-        schema = """
-        CREATE TABLE IF NOT EXISTS files (
+        """Création des tables Mère et Filles."""
+        cursor = self.conn.cursor()
+        
+        # 1. TABLE MÈRE : Inventaire Global
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS files_inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path_hash TEXT,
             content_hash TEXT,
             file_path TEXT UNIQUE,
             filename TEXT,
-            extension TEXT,
+            visible_ext TEXT,
+            true_ext TEXT,
             size_bytes INTEGER,
-            creation_date DATETIME,
-            modification_date DATETIME,
-            category TEXT,
-            processing_status TEXT DEFAULT 'PENDING',
-            ai_data JSON,
-            tech_data JSON,
+            dates_created DATETIME,
+            dates_modified DATETIME,
+            category TEXT,          -- ex: 'PLAN', 'TRASH'
+            status TEXT DEFAULT 'PENDING',
             risk_score INTEGER DEFAULT 0
         );
+        """)
         
-        CREATE INDEX IF NOT EXISTS idx_content_hash ON files(content_hash);
-        CREATE INDEX IF NOT EXISTS idx_path_hash ON files(path_hash);
-        """
-        try:
-            cursor = self.conn.cursor()
-            cursor.executescript(schema)
-            self.conn.commit()
-        except sqlite3.Error as e:
-            print(f"[ERREUR] Création schéma : {e}")
+        # Index pour la rapidité
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_content ON files_inventory(content_hash);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_path ON files_inventory(path_hash);")
 
-    def insert_file(self, file_data: dict):
-        """Insère ou met à jour le fichier avec son score de risque."""
-        query = """
-        INSERT INTO files (
-            path_hash, content_hash, file_path, filename, extension, 
-            size_bytes, creation_date, modification_date, category,
-            risk_score, processing_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(file_path) DO UPDATE SET
-            content_hash=excluded.content_hash,
-            modification_date=excluded.modification_date,
-            size_bytes=excluded.size_bytes,
-            risk_score=excluded.risk_score,
-            processing_status=excluded.processing_status;
+        # 2. TABLES SATELLITES (Spécialisation)
+        
+        # A. CAD / CAO (.dwg, .rvt)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS meta_cad (
+            file_id INTEGER PRIMARY KEY,
+            software_version TEXT,  -- ex: 'AutoCAD 2018'
+            has_xrefs BOOLEAN,      -- Références externes détectées ?
+            scale TEXT,             -- Échelle potentielle
+            FOREIGN KEY(file_id) REFERENCES files_inventory(id) ON DELETE CASCADE
+        );
+        """)
+
+        # B. DOCUMENTS (.pdf, .docx)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS meta_document (
+            file_id INTEGER PRIMARY KEY,
+            page_count INTEGER,
+            author TEXT,
+            is_encrypted BOOLEAN,
+            producer_tool TEXT,     -- ex: 'Revit PDF Writer'
+            FOREIGN KEY(file_id) REFERENCES files_inventory(id) ON DELETE CASCADE
+        );
+        """)
+
+        # C. VISUAL / IMAGES (.jpg, .png)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS meta_visual (
+            file_id INTEGER PRIMARY KEY,
+            width INTEGER,
+            height INTEGER,
+            color_space TEXT,       -- RGB / CMYK
+            geo_lat REAL,           -- GPS Latitude
+            geo_long REAL,          -- GPS Longitude
+            FOREIGN KEY(file_id) REFERENCES files_inventory(id) ON DELETE CASCADE
+        );
+        """)
+
+        # D. SPREADSHEET (.xlsx, .csv)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS meta_spreadsheet (
+            file_id INTEGER PRIMARY KEY,
+            sheet_count INTEGER,
+            row_limit INTEGER,      -- Pour estimer la densité
+            has_macros BOOLEAN,     -- Sécurité (.xlsm)
+            FOREIGN KEY(file_id) REFERENCES files_inventory(id) ON DELETE CASCADE
+        );
+        """)
+
+        # E. ARCHIVE (.zip, .rar)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS meta_archive (
+            file_id INTEGER PRIMARY KEY,
+            file_count INTEGER,     -- Combien de fichiers dedans ?
+            compression_ratio REAL,
+            is_encrypted BOOLEAN,
+            FOREIGN KEY(file_id) REFERENCES files_inventory(id) ON DELETE CASCADE
+        );
+        """)
+
+        self.conn.commit()
+
+    def insert_full_entry(self, main_data: dict, meta_table: str = None, meta_data: dict = None):
         """
+        Transaction atomique : Insère dans Inventaire -> Récupère ID -> Insère dans Meta.
+        """
+        cursor = self.conn.cursor()
         try:
-            cursor = self.conn.cursor()
-            cursor.execute(query, (
-                file_data['path_hash'],
-                file_data['content_hash'],
-                file_data['file_path'],
-                file_data['filename'],
-                file_data['extension'],
-                file_data['size_bytes'],
-                file_data['creation_date'],
-                file_data['modification_date'],
-                "UNKNOWN",
-                file_data['risk_score'],
-                file_data['processing_status']
+            # 1. Insertion/Update Table Mère
+            # On utilise une syntaxe UPSERT compatible SQLite moderne
+            query_main = """
+            INSERT INTO files_inventory (
+                path_hash, content_hash, file_path, filename, 
+                visible_ext, true_ext, size_bytes, 
+                dates_created, dates_modified, category, risk_score, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(file_path) DO UPDATE SET
+                content_hash=excluded.content_hash,
+                dates_modified=excluded.dates_modified,
+                status=excluded.status,
+                risk_score=excluded.risk_score;
+            """
+            
+            cursor.execute(query_main, (
+                main_data['path_hash'], main_data['content_hash'], main_data['file_path'], 
+                main_data['filename'], main_data['visible_ext'], main_data['true_ext'],
+                main_data['size_bytes'], main_data['dates_created'], main_data['dates_modified'],
+                main_data['category'], main_data['risk_score'], main_data['status']
             ))
-            self.conn.commit()
-        except sqlite3.Error as e:
-            print(f"[ERREUR] Insertion {file_data['filename']} : {e}")
 
-    def get_duplicates(self) -> List[sqlite3.Row]:
-        """Récupère les doublons stricts (hors fichiers déchets)."""
+            # Récupération de l'ID (soit le nouvel ID, soit l'existant)
+            # Rowid fonctionne, mais pour être sûr en cas d'update sans changement d'ID :
+            cursor.execute("SELECT id FROM files_inventory WHERE file_path = ?", (main_data['file_path'],))
+            row = cursor.fetchone()
+            if not row:
+                raise Exception("ID non retrouvé après insertion.")
+            
+            file_id = row['id']
+
+            # 2. Insertion Table Fille (si métadonnées présentes)
+            if meta_table and meta_data:
+                # Construction dynamique de la requête SQL pour la table fille
+                columns = list(meta_data.keys())
+                placeholders = ', '.join(['?'] * len(columns))
+                col_names = ', '.join(columns)
+                
+                # On ajoute file_id manuellement
+                sql_meta = f"INSERT OR REPLACE INTO {meta_table} (file_id, {col_names}) VALUES (?, {placeholders})"
+                
+                values = [file_id] + list(meta_data.values())
+                cursor.execute(sql_meta, values)
+
+            self.conn.commit()
+
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            print(f"[SQL ERROR] Sur {main_data['filename']}: {e}")
+
+    def get_duplicates(self):
+        """
+        Version adaptée à la nouvelle structure.
+        CORRECTIF : Ajout de GROUP_CONCAT pour récupérer la liste 'paths'
+        """
         query = """
-        SELECT content_hash, COUNT(*) as count, GROUP_CONCAT(file_path, ' || ') as paths, SUM(size_bytes) as total_wasted
-        FROM files
-        WHERE processing_status != 'TRASH_EXT' 
+        SELECT 
+            content_hash, 
+            COUNT(*) as count, 
+            GROUP_CONCAT(file_path, ' || ') as paths,
+            SUM(size_bytes) as total_wasted
+        FROM files_inventory
+        WHERE category != 'TRASH_EXT' 
         GROUP BY content_hash
         HAVING count > 1
         ORDER BY total_wasted DESC
@@ -99,8 +189,7 @@ class DatabaseManager:
         return cursor.fetchall()
         
     def get_trash_stats(self) -> dict:
-        """Récupère les stats des fichiers déchets détectés."""
-        query = "SELECT COUNT(*) as count, SUM(size_bytes) as size FROM files WHERE risk_score >= 90"
+        query = "SELECT COUNT(*) as count, SUM(size_bytes) as size FROM files_inventory WHERE risk_score >= 90"
         cursor = self.conn.cursor()
         cursor.execute(query)
         row = cursor.fetchone()

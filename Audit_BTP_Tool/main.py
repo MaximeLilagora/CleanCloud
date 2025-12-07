@@ -20,34 +20,23 @@ except ImportError as e:
 
 from src.utils.db_client import DatabaseManager
 from src.connectors.local_loader import scan_directory
+from src.utils.reporter import AuditReporter  # Import du nouveau reporter
 
-def generate_report(db: DatabaseManager):
+def display_summary(db: DatabaseManager):
+    """Affiche un résumé rapide dans la console avant l'export."""
     duplicates = db.get_duplicates()
     trash_stats = db.get_trash_stats()
     
     print("\n" + "="*50)
-    print("RAPPORT D'AUDIT (SIMPLIFIÉ)")
+    print("RÉSUMÉ RAPIDE")
     print("="*50)
+    print(f"DÉCHETS DÉTECTÉS : {trash_stats['count']} fichiers ({trash_stats['size']/1024/1024:.2f} MB)")
     
-    print(f"DÉCHETS : {trash_stats['count']} fichiers ({trash_stats['size']/1024/1024:.2f} MB)")
-    print("-" * 50)
-
-    if not duplicates:
-        print("Aucun doublon strict détecté.")
+    if duplicates:
+        print(f"DOUBLONS STRICTS : {len(duplicates)} groupes identifiés.")
     else:
-        total_wasted = 0
-        print(f"{'Hash':<15} | {'Copies':<8} | {'Perte':<10} | {'Exemple'}")
-        print("-" * 50)
-        
-        for row in duplicates:
-            wasted = row['total_wasted'] - (row['total_wasted'] / row['count'])
-            total_wasted += wasted
-            paths = row['paths'].split(' || ')
-            display_hash = row['content_hash'][:12] if row['content_hash'] else "N/A"
-            print(f"{display_hash:<15} | {row['count']:<8} | {wasted/1024/1024:.1f} MB  | {paths[0][:30]}...")
-
-        print("-" * 50)
-        print(f"GAIN POTENTIEL : {(total_wasted + trash_stats['size'])/1024/1024:.2f} MB")
+        print("Aucun doublon strict détecté.")
+    print("-" * 50)
 
 def main():
     print("=== AUDIT BTP TOOL ===")
@@ -55,12 +44,21 @@ def main():
     # Initialisation
     db = DatabaseManager(DB_NAME)
     
-    # Scan
+    # 1. Scan
     target_dir = input("Dossier à auditer : ").strip()
     
     if os.path.exists(target_dir):
+        # Lancement du scan
         scan_directory(target_dir, db)
-        generate_report(db)
+        
+        # 2. Résumé Console
+        display_summary(db)
+        
+        # 3. Génération Rapport
+        print("\n[REPORTING] Exportation des données...")
+        reporter = AuditReporter(db)
+        reporter.generate_full_audit()
+        
     else:
         print("[ERREUR] Dossier introuvable.")
     

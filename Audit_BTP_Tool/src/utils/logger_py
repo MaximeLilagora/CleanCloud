@@ -1,0 +1,65 @@
+import logging
+import logging.config
+import os
+
+def setup_logging(log_file='audit.log'):
+    """
+    Configure le logging directement en Python (sans YAML).
+    - Console : Affiche INFO et supérieur.
+    - Fichier : Enregistre tout (DEBUG), avec rotation (10 Mo).
+    """
+    
+    # Configuration sous forme de dictionnaire Python
+    logging_config = {
+        'version': 1,
+        'disable_existing_loggers': False,
+        
+        'formatters': {
+            'standard': {
+                'format': '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+                'datefmt': '%Y-%m-%d %H:%M:%S'
+            },
+            'simple': {
+                'format': '%(message)s'
+            },
+        },
+        
+        'handlers': {
+            'console': {
+                'level': 'INFO',
+                'class': 'logging.StreamHandler',
+                'formatter': 'simple',
+                'stream': 'ext://sys.stdout'
+            },
+            'file_handler': {
+                'level': 'DEBUG',
+                'class': 'logging.handlers.RotatingFileHandler',
+                'formatter': 'standard',
+                'filename': log_file,
+                'maxBytes': 10 * 1024 * 1024, # 10 Mo
+                'backupCount': 5,
+                'encoding': 'utf8'
+            },
+        },
+        
+        'loggers': {
+            '': {  # Root logger
+                'handlers': ['console', 'file_handler'],
+                'level': 'DEBUG',
+                'propagate': True
+            },
+        }
+    }
+
+    try:
+        logging.config.dictConfig(logging_config)
+        # Petit message pour confirmer le démarrage (apparaîtra dans le fichier et la console)
+        logging.info("Système de logging initialisé (Configuration Python).")
+    except Exception as e:
+        # Fallback de sécurité en cas de problème critique
+        print(f"Erreur configuration logging: {e}")
+        logging.basicConfig(level=logging.INFO)
+
+def get_logger(name):
+    """Retourne une instance de logger pour le module appelant."""
+    return logging.getLogger(name)

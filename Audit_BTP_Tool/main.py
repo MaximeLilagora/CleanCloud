@@ -1,11 +1,16 @@
 import os
 import sys
+from src.utils.logger import setup_logging, get_logger
+
+# On appelle la fonction logger
+setup_logging() 
+logger = get_logger(__name__)
 
 # Ajout du dossier courant au path pour garantir les imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
-try:
+try: 
     from config.settings import DB_NAME
 except ImportError as e:
     print(f"[ERREUR CRITIQUE] Impossible d'importer la configuration.")
